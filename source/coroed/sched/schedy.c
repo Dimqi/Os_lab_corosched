@@ -8,31 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <threads.h>
 
 #include "coroed/api/task.h"
-#include "coroed/core/relax.h"
-#include "coroed/core/spinlock.h"
 #include "kthread.h"
 #include "uthread.h"
 
 enum {
   /**
-   * Максимальное количество файберов, которое может
-   * одновременно выполняться на планировщике.
-   */
-  SCHED_THREADS_LIMIT = 512,
-
-  /**
    * Количество рабочих потоков для исполнения файберов.
    */
   SCHED_WORKERS_COUNT = (size_t)(8),
-
-  /**
-   * Обеспечивает костыль для ретрая операций
-   * `submit` и `acquire_next` при высокой
-   * конкуренции на спинлоках файберов.
-   */
-  SCHED_NEXT_MAX_ATTEMPTS = (size_t)(16),
 };
 
 /**
@@ -63,17 +49,15 @@ struct task {
     /** Прямо сейчас выполняется. */
     UTHREAD_RUNNING,
 
-    /** Завершена и скоро станет зомби. */
+    /** Завершена, контекст будет освобожден планировщиком. */
     UTHREAD_FINISHED,
-
-    /** Отработала и может быть переиспользования. */
-    UTHREAD_ZOMBIE,
   } state;  // Текущее состояние задачи
 
-  /**
-   * Защищает поля структуры от неупорядоченного доступа.
-   */
-  struct spinlock lock;
+  struct task* next;
+
+  size_t priority;
+
+  size_t yields_left;
 };
 
 /**
@@ -109,25 +93,26 @@ struct worker {
   } statistics;       // Локальная статистика работяги
 };
 
-static struct spinlock tasks_lock;              // Защищает список задач
-static size_t next_task_index = 0;              // Для планирования round-robin
-static struct task tasks[SCHED_THREADS_LIMIT];  // Список всех задач
-
-// Hint: для реализации более сложных схем управления, вам
-//       вам могут понадобиться связаные списки (`core/list.h`).
 
 static kthread_id_t kthread_ids[SCHED_WORKERS_COUNT];
 static struct worker workers[SCHED_WORKERS_COUNT];
 
-/**
- * Установить задачу в пустое состояние.
- */
-void sched_task_init(struct task* task) {
-  task->thread = NULL;
-  task->worker = NULL;
-  task->state = UTHREAD_ZOMBIE;
-  spinlock_init(&task->lock);
-}
+enum {
+    PRIORITY_LEVELS = 3,
+    BOOST_INTERVAL = 64,
+};
+
+struct ready_queue {
+    struct task* head;
+    struct task* tail;
+};
+
+static const size_t yield_budget[PRIORITY_LEVELS] = {1, 2, 4};
+static struct ready_queue ready[PRIORITY_LEVELS];
+static mtx_t ready_lock;
+static cnd_t ready_changed;
+static size_t unfinished_tasks;
+static size_t dispatches_since_boost;
 
 /**
  * Установить рабочего в пустое состояние.
@@ -141,10 +126,18 @@ void sched_worker_init(struct worker* worker, size_t index) {
 }
 
 void sched_init() {
-  spinlock_init(&tasks_lock);
-  for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
-    sched_task_init(&tasks[i]);
+  memset(ready, 0, sizeof(ready));
+  unfinished_tasks = 0;
+  dispatches_since_boost = 0;
+
+  if (mtx_init(&ready_lock, mtx_plain) != thrd_success) {
+    abort();
   }
+  if (cnd_init(&ready_changed) != thrd_success) {
+    mtx_destroy(&ready_lock);
+    abort();
+  }
+
   for (size_t i = 0; i < SCHED_WORKERS_COUNT; ++i) {
     kthread_ids[i] = 0;
     sched_worker_init(&workers[i], i);
@@ -182,16 +175,14 @@ void sched_switch_to(struct worker* worker, struct task* task) {
  * Получить следующую задачу на исполнение в
  * соответствии с текущим алгоритмом планирования.
  *
- * Вызывающему передается владение задачей, а также
- * захваченный лок `task->lock`.
+ * Вызывающему передается владение задачей после снятия
+ * с очереди. Мьютекс очереди отпускается до возврата.
  */
 struct task* sched_acquire_next();
 
 /**
- * Вернуть задачу в очередь планирования.
- *
- * Очереди передается владение задачей,
- * а также она отпустит лок `task->lock`.
+ * Вернуть готовую задачу в очередь планирования
+ * либо освободить завершенную задачу.
  */
 void sched_release(struct task* task);
 
@@ -209,6 +200,7 @@ int sched_loop(void* argument) {
     }
 
     sched_switch_to(worker, task);
+    worker->running_task = NULL;
 
     worker->statistics.steps += 1;
     if (task->state == UTHREAD_FINISHED) {
@@ -226,50 +218,105 @@ int sched_loop(void* argument) {
   return 0;
 }
 
-struct task* sched_acquire_next() {
-  // На всякий случай пытаемся найти задачу несколько раз,
-  // так как какие-то `task->lock` могли быть отпущены.
+static void ready_push(struct task* task) {
+    struct ready_queue* queue = &ready[task->priority];
+    task->next = NULL;
 
-  for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
-    spinlock_lock(&tasks_lock);  // Защитим `next_task_index`
-
-    for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
-      struct task* task = &tasks[next_task_index];
-      if (!spinlock_try_lock(&task->lock)) {
-        continue;
-      }
-
-      // Планирование round-robin
-      next_task_index = (next_task_index + 1) % SCHED_THREADS_LIMIT;
-
-      if (task->thread != NULL && task->state == UTHREAD_RUNNABLE) {
-        spinlock_unlock(&tasks_lock);
-        return task;
-      }
-
-      spinlock_unlock(&task->lock);
+    if (queue->tail != NULL) {
+        queue->tail->next = task;
+    } else {
+        queue->head = task;
     }
 
-    spinlock_unlock(&tasks_lock);
-    SPINLOOP(2 * attempt);
-  }
+    queue->tail = task;
+}
 
-  return NULL;
+static struct task* ready_pop(size_t priority) {
+    struct ready_queue* queue = &ready[priority];
+    struct task* task = queue->head;
+
+    if (task == NULL) {
+        return NULL;
+    }
+
+    queue->head = task->next;
+    if (queue->head == NULL) {
+        queue->tail = NULL;
+    }
+
+    task->next = NULL;
+    return task;
+}
+
+static void boost_ready_tasks(void) {
+    for (size_t priority = 1; priority < PRIORITY_LEVELS; ++priority) {
+        struct task* task;
+        while ((task = ready_pop(priority)) != NULL) {
+            task->priority = 0;
+            task->yields_left = yield_budget[0];
+            ready_push(task);
+        }
+    }
+}
+
+struct task* sched_acquire_next() {
+    mtx_lock(&ready_lock);
+
+    for (;;) {
+        for (size_t priority = 0; priority < PRIORITY_LEVELS; ++priority) {
+            struct task* task = ready_pop(priority);
+            if (task == NULL) {
+                continue;
+            }
+
+            if (++dispatches_since_boost == BOOST_INTERVAL) {
+                boost_ready_tasks();
+                dispatches_since_boost = 0;
+            }
+
+            mtx_unlock(&ready_lock);
+            return task;
+        }
+
+        if (unfinished_tasks == 0) {
+            mtx_unlock(&ready_lock);
+            return NULL;
+        }
+
+        cnd_wait(&ready_changed, &ready_lock);
+    }
 }
 
 void sched_release(struct task* task) {
-  task->worker = NULL;
-  if (task->state == UTHREAD_FINISHED) {
-    // Отправляем задачу на кладбище, а могли бы
-    // еще, например, разблокировать зависимые задачи.
-    uthread_reset(task->thread);
-    task->state = UTHREAD_ZOMBIE;
-  } else if (task->state == UTHREAD_RUNNING) {
+    task->worker = NULL;
+
+    if (task->state == UTHREAD_FINISHED) {
+        uthread_free(task->thread);
+        free(task);
+
+        mtx_lock(&ready_lock);
+        if (--unfinished_tasks == 0) {
+            cnd_broadcast(&ready_changed);
+        }
+        mtx_unlock(&ready_lock);
+        return;
+    }
+
+    assert(task->state == UTHREAD_RUNNING);
+
+    if (--task->yields_left == 0) {
+        if (task->priority + 1 < PRIORITY_LEVELS) {
+            ++task->priority;
+        }
+        task->yields_left = yield_budget[task->priority];
+    }
+
     task->state = UTHREAD_RUNNABLE;
-  } else /* if (task->state == UTHREAD_BLOCKED) */ {
-    assert(false && "Not implemented");
-  }
-  spinlock_unlock(&task->lock);
+
+    mtx_lock(&ready_lock);
+    ready_push(task);
+    cnd_signal(&ready_changed);
+    mtx_unlock(&ready_lock);
 }
 
 /**
@@ -294,51 +341,33 @@ task_t task_submit(struct task* caller, uthread_routine entry, void* argument) {
   return child;
 }
 
-task_t sched_try_submit(void (*entry)(), void* argument) {
-  for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
-    struct task* task = &tasks[i];
-
-    if (!spinlock_try_lock(&task->lock)) {
-      continue;
+task_t sched_submit(uthread_routine entry, void* argument) {
+    struct task* task = calloc(1, sizeof(*task));
+    if (task == NULL) {
+        abort();
     }
 
+    task->thread = uthread_allocate();
     if (task->thread == NULL) {
-      task->thread = uthread_allocate();
-      assert(task->thread != NULL);
-      task->state = UTHREAD_ZOMBIE;
+        free(task);
+        abort();
     }
 
-    const bool is_submitted = task->state == UTHREAD_ZOMBIE;
+    uthread_set_entry(task->thread, entry);
+    uthread_set_arg_0(task->thread, task);
+    uthread_set_arg_1(task->thread, argument);
+    task->state = UTHREAD_RUNNABLE;
+    task->priority = 0;
+    task->yields_left = yield_budget[0];
 
-    if (task->state == UTHREAD_ZOMBIE) {
-      uthread_reset(task->thread);
-      uthread_set_entry(task->thread, entry);
-      uthread_set_arg_0(task->thread, task);
-      uthread_set_arg_1(task->thread, argument);
-      task->state = UTHREAD_RUNNABLE;
-    }
+    mtx_lock(&ready_lock);
+    ++unfinished_tasks;
+    ready_push(task);
+    cnd_signal(&ready_changed);
+    mtx_unlock(&ready_lock);
 
-    spinlock_unlock(&task->lock);
-    if (is_submitted) {
-      return (task_t){.task = task};
-    }
-  }
-
-  return (task_t){.task = NULL};
+    return (task_t){.task = task};
 }
-
-task_t sched_submit(void (*entry)(), void* argument) {
-  for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
-    task_t handle = sched_try_submit(entry, argument);
-    if (handle.task != NULL) {
-      return handle;
-    }
-    SPINLOOP(2 * attempt);
-  }
-
-  assert(false && "Can't create a task");
-}
-
 void sched_start() {
   for (size_t i = 0; i < SCHED_WORKERS_COUNT; ++i) {
     struct worker* worker = &workers[i];
@@ -378,12 +407,6 @@ void sched_print_statistics() {
 }
 
 void sched_destroy() {
-  for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
-    struct task* task = &tasks[i];
-    spinlock_lock(&task->lock);
-    if (task->thread != NULL) {
-      uthread_free(task->thread);
-    }
-    spinlock_unlock(&task->lock);
-  }
+  cnd_destroy(&ready_changed);
+  mtx_destroy(&ready_lock);
 }
